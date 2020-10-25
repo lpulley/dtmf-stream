@@ -6,6 +6,7 @@ import sounddevice
 import numpy
 import scipy.signal
 from datetime import datetime, timedelta
+import time
 
 TONES_LOW = {697, 770, 852, 941}
 TONES_HIGH = {1209, 1336, 1477, 1633}
@@ -28,25 +29,28 @@ TONES = {
     (941, 1633): 'D',
 }
 
-def detect_tone(strength=0.01, tone_time=0.5, hang_time=0.1):
+def detect_tone(tone_time, hang_time, *, strength=0.01, debounce=3):
     """
-    strength: A value in the range [0, 1] specifying how strong a tone must be in order to not be considered noise
     tone_time: A value in seconds specifying how long a tone must last before it is considered a press
     hang_time: A value in seconds specifying how much silence must follow a press before it is considered complete
+    strength: A value in the range [0, 1] specifying how strong a tone must be in order to not be considered noise
+    debounce: The number of frames of debouncing to apply; higher values will decrease output noise and responsiveness
     """
 
     tone_time = timedelta(seconds=tone_time)
     hang_time = timedelta(seconds=hang_time)
     sample_rate = sounddevice.query_devices(sounddevice.default.device, 'input')['default_samplerate']
 
-    last_time = datetime.now()
-    tone = None
-    time_on = timedelta()
-    pressed = None
+    last_time = datetime.now() # The last time audio was processed
+    saved_tone = None
+    seen_tone = None
+    seen_count = 0
+    time_on = timedelta() # How long ago the current tone was initially seen
+    pressed = None # The pressed tone if we are in hang time, otherwise `None`
     complete = False
 
-    def callback(indata, frames, time, status):
-        nonlocal tone, time_on, pressed, complete
+    def listen(indata, frames, time, status):
+        nonlocal last_time, saved_tone, seen_tone, seen_count, time_on, pressed, complete
 
         # Do a fast Fourier transform to get the magnitudes of different frequencies
         magnitudes = numpy.abs(numpy.fft.rfft(indata[:, 0]))
@@ -66,22 +70,40 @@ def detect_tone(strength=0.01, tone_time=0.5, hang_time=0.1):
         max_high = max(magnitudes_high, key=magnitudes_high.get, default=None)
         found_tone = TONES.get((max_low, max_high))
 
-        if found_tone == tone:
-            time_on += datetime.now() - last_time
+        # Keep track of debouncing
+        if found_tone == seen_tone:
+            if seen_count < debounce:
+                # If we haven't seen this tone for long enough, keep counting
+                seen_count += 1
+            elif found_tone != saved_tone:
+                # If we've now see this tone for long enough, save it
+                saved_tone = found_tone
+                time_on = timedelta()
         else:
-            tone = found_tone
-            time_on = timedelta()
+            # If the tone just changed, start over
+            seen_tone = found_tone
+            seen_count = 1
+        time_on += datetime.now() - last_time
+        last_time = datetime.now()
 
+        # Update the listening state
         if pressed is None:
-            if tone is not None and time_on > tone_time:
-                pressed = tone
+            if saved_tone is not None and time_on > tone_time:
+                # If we have seen a whole tone time elapse, switch to waiting for hang time
+                pressed = saved_tone
         else:
-            if tone is not None:
+            if saved_tone == seen_tone and saved_tone is not None:
+                # If we see a tone during hang time, go listen for a new tone
                 pressed = None
             elif time_on > hang_time:
+                # If we have seen a whole hang time elapse, the press is complete
                 complete = True
+                raise sounddevice.CallbackStop
 
-    with sounddevice.InputStream(channels=1, callback=callback, device=sounddevice.default.device):
+        print(last_time, saved_tone, seen_tone, seen_count, time_on, pressed, complete)
+
+    # Create and start a stream, waiting to close it until a press has been detected
+    with (stream := sounddevice.InputStream(channels=1, callback=listen, device=sounddevice.default.device)):
         while not complete:
             pass
 
@@ -89,4 +111,4 @@ def detect_tone(strength=0.01, tone_time=0.5, hang_time=0.1):
 
 if __name__ == '__main__':
     while True:
-        print(detect_tone(), end='', flush=True)
+        print(detect_tone(0.25, 0.05), end='', flush=True)
